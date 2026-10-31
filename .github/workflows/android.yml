@@ -1,0 +1,104 @@
+name: Android Release APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # GitHub-hosted Ubuntu runners already provide Android command-line tools.
+      # Do not use android-actions/setup-android here: its setup path may request
+      # the retired SDK package named "tools", causing sdkmanager to fail.
+      - name: Locate Android SDK manager
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print | sort -V | tail -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "Could not find sdkmanager under $ANDROID_HOME/cmdline-tools" >&2
+            exit 1
+          fi
+          echo "sdkmanager=$SDKMANAGER" >> "$GITHUB_OUTPUT"
+          echo "Using $SDKMANAGER"
+
+      - name: Accept Android SDK licences
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="${{ steps.sdk.outputs.sdkmanager }}"
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses
+          set -o pipefail
+
+      - name: Install Android platform and build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="${{ steps.sdk.outputs.sdkmanager }}"
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Restore persistent release signing key
+        env:
+          SYLENTH_KEYSTORE_BASE64: ${{ secrets.SYLENTH_KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${SYLENTH_KEYSTORE_BASE64:-}" ]; then
+            echo "Missing GitHub Actions secret: SYLENTH_KEYSTORE_BASE64" >&2
+            exit 1
+          fi
+          printf '%s' "$SYLENTH_KEYSTORE_BASE64" | base64 --decode > app/sylenth-release.jks
+          test -s app/sylenth-release.jks
+          chmod 600 app/sylenth-release.jks
+
+      - name: Build signed release APK
+        env:
+          SYLENTH_KEYSTORE_PASSWORD: ${{ secrets.SYLENTH_KEYSTORE_PASSWORD }}
+          SYLENTH_KEY_ALIAS: ${{ secrets.SYLENTH_KEY_ALIAS }}
+          SYLENTH_KEY_PASSWORD: ${{ secrets.SYLENTH_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SYLENTH_KEYSTORE_PASSWORD"
+          test -n "$SYLENTH_KEY_ALIAS"
+          test -n "$SYLENTH_KEY_PASSWORD"
+          gradle --no-daemon :app:assembleRelease
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SylenthAI-v0.2.2-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f app/sylenth-release.jks

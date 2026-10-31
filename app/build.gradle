@@ -1,0 +1,42 @@
+plugins {
+    id 'com.android.application'
+}
+
+def releaseStorePassword = System.getenv('SYLENTH_KEYSTORE_PASSWORD')
+def releaseKeyAlias = System.getenv('SYLENTH_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('SYLENTH_KEY_PASSWORD')
+
+android {
+    namespace 'com.sf12.sylenthai'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.sf12.sylenthai'
+        minSdk 26
+        targetSdk 35
+        versionCode 4
+        versionName '0.2.2'
+    }
+
+    signingConfigs {
+        release {
+            // Created by GitHub Actions from the repository secret at build time.
+            storeFile file('sylenth-release.jks')
+            storePassword releaseStorePassword
+            keyAlias releaseKeyAlias
+            keyPassword releaseKeyPassword
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
