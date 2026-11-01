@@ -81,55 +81,56 @@ public final class SylenthFxp {
     }
 
     public static Preset parse(byte[] data) throws IllegalArgumentException {
-        if (data == null || data.length < OUTER_HEADER_SIZE + 1024) {
-            throw new IllegalArgumentException("File is too small to be a Sylenth1 FXP preset.");
+        if (data == null || data.length < OUTER_HEADER_SIZE) {
+            throw new IllegalArgumentException("File is too short to contain a complete VST FXP header (60 bytes required).");
         }
-        if (!ascii(data, 0, 4).equals("CcnK")) {
-            throw new IllegalArgumentException("This is not a VST FXP file (missing CcnK header).");
+        if (!ascii(data, 0, 4).equals("CcnK")) throw new IllegalArgumentException("This is not a VST FXP file (missing CcnK header).");
+        if (!ascii(data, 8, 4).equals("FPCh")) throw new IllegalArgumentException("This FXP is not a chunk-based single preset (FPCh).");
+        if (!ascii(data, 16, 4).equals("syl1")) throw new IllegalArgumentException("This FXP does not identify itself as a Sylenth1 preset.");
+
+        long declaredFileSize = Integer.toUnsignedLong(readIntBE(data, 4));
+        if (declaredFileSize > data.length - 8L) throw new IllegalArgumentException("The FXP header declares a file size larger than the file received; it may be truncated.");
+        long declaredChunkSize = Integer.toUnsignedLong(readIntBE(data, 56));
+        if (declaredChunkSize < 8 || declaredChunkSize > data.length - OUTER_HEADER_SIZE) {
+            throw new IllegalArgumentException("The FXP chunk size is invalid or the preset data is truncated.");
         }
-        if (!ascii(data, 8, 4).equals("FPCh")) {
-            throw new IllegalArgumentException("This FXP is not a chunk-based single preset (FPCh).");
-        }
-        if (!ascii(data, 16, 4).equals("syl1")) {
-            throw new IllegalArgumentException("This FXP does not identify itself as a Sylenth1 preset.");
-        }
-        int chunkSize = readIntBE(data, 56);
-        if (chunkSize <= 0 || chunkSize > data.length - OUTER_HEADER_SIZE) {
-            throw new IllegalArgumentException("The FXP chunk size is invalid or truncated.");
-        }
+        int chunkSize = (int) declaredChunkSize;
         String innerMagic = ascii(data, OUTER_HEADER_SIZE, 4);
-        if (!innerMagic.equals("1lys") && !innerMagic.equals("syl1")) {
-            throw new IllegalArgumentException("The embedded Sylenth1 data header is not recognised.");
-        }
+        if (!innerMagic.equals("1lys") && !innerMagic.equals("syl1")) throw new IllegalArgumentException("The embedded Sylenth1 data header is not recognised.");
         ByteBuffer b = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int version = b.getInt(OUTER_HEADER_SIZE + 4);
-        if (version != 2011 && version != 2202 && version != 2211) {
-            throw new IllegalArgumentException("Unsupported Sylenth1 preset data version: " + version);
-        }
+        if (version != 2011 && version != 2202 && version != 2211) throw new IllegalArgumentException("Unsupported Sylenth1 preset data version: " + version);
         int nameOffset = version == 2011 ? 988 : 992;
-        if (chunkSize < nameOffset + 36 || OUTER_HEADER_SIZE + nameOffset + 36 > data.length) {
-            throw new IllegalArgumentException("The Sylenth1 preset data is incomplete.");
+        if (chunkSize < nameOffset) {
+            throw new IllegalArgumentException("Sylenth1 preset data is truncated: version " + version
+                    + " requires at least " + nameOffset + " bytes for its parameter data, but only " + chunkSize + " are present.");
         }
-        String name = readFixedAscii(data, OUTER_HEADER_SIZE + nameOffset, 36);
-        if (name.trim().isEmpty()) name = readFixedAscii(data, 28, 28);
-        return new Preset(Arrays.copyOf(data, data.length), version, chunkSize, nameOffset, name.trim());
+        int innerNameLength = Math.max(0, Math.min(36, chunkSize - nameOffset));
+        String name = innerNameLength > 0 ? readFixedAscii(data, OUTER_HEADER_SIZE + nameOffset, innerNameLength).trim() : "";
+        if (name.isEmpty()) name = readFixedAscii(data, 28, 28).trim();
+        if (name.isEmpty()) name = "Unnamed Sylenth1 preset";
+        return new Preset(Arrays.copyOf(data, data.length), version, chunkSize, nameOffset, name);
     }
 
-    /** Builds a new FXP from the closest preset, blending continuous controls only when
-     *  every neighbour has the same discrete synth architecture as the base preset. */
     public static byte[] synthesize(Preset base, Preset[] neighbours, double[] weights, String outputName) {
-        byte[] out = Arrays.copyOf(base.bytes, base.bytes.length);
+        int outputChunkSize = Math.max(base.chunkSize, base.innerNameOffset + 36);
+        int addedBytes = outputChunkSize - base.chunkSize;
+        byte[] out;
+        if (addedBytes > 0) {
+            int oldChunkEnd = OUTER_HEADER_SIZE + base.chunkSize;
+            out = new byte[base.bytes.length + addedBytes];
+            System.arraycopy(base.bytes, 0, out, 0, oldChunkEnd);
+            System.arraycopy(base.bytes, oldChunkEnd, out, oldChunkEnd + addedBytes, base.bytes.length - oldChunkEnd);
+        } else {
+            out = Arrays.copyOf(base.bytes, base.bytes.length);
+        }
         String safeName = sanitizeName(outputName == null ? "Sylenth AI Match" : outputName);
         writeFixedAscii(out, 28, 28, safeName);
         writeFixedAscii(out, OUTER_HEADER_SIZE + base.innerNameOffset, 36, safeName);
-
         if (neighbours != null && weights != null && neighbours.length == weights.length && neighbours.length > 1) {
             boolean compatible = true;
             for (Preset p : neighbours) {
-                if (p == null || p.version != base.version || p.chunkSize != base.chunkSize || !hasSameTopology(base, p)) {
-                    compatible = false;
-                    break;
-                }
+                if (p == null || p.version != base.version || p.chunkSize != base.chunkSize || !hasSameTopology(base, p)) { compatible = false; break; }
             }
             if (compatible) {
                 ByteBuffer target = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
@@ -137,33 +138,25 @@ public final class SylenthFxp {
                     int offset = FLOAT_OFFSETS[j];
                     if (contains(DO_NOT_INTERPOLATE, offset)) continue;
                     int pos = OUTER_HEADER_SIZE + offset;
-                    double wSum = 0.0;
-                    double valueSum = 0.0;
+                    double wSum = 0.0, valueSum = 0.0;
                     boolean valid = true;
                     for (int n = 0; n < neighbours.length; n++) {
                         float v = neighbours[n].params[j];
-                        if (!Float.isFinite(v) || !Double.isFinite(weights[n]) || weights[n] <= 0) {
-                            valid = false;
-                            break;
-                        }
-                        double transformed = contains(LOG_INTERPOLATE, offset) && v > 0
-                                ? Math.log(v) : v;
+                        if (!Float.isFinite(v) || !Double.isFinite(weights[n]) || weights[n] <= 0) { valid = false; break; }
+                        double transformed = contains(LOG_INTERPOLATE, offset) && v > 0 ? Math.log(v) : v;
                         valueSum += transformed * weights[n];
                         wSum += weights[n];
                     }
                     if (!valid || wSum <= 0) continue;
                     double mean = valueSum / wSum;
                     if (contains(LOG_INTERPOLATE, offset)) mean = Math.exp(mean);
-                    if (Double.isFinite(mean) && Math.abs(mean) < 1.0e7) {
-                        target.putFloat(pos, (float) mean);
-                    }
+                    if (Double.isFinite(mean) && Math.abs(mean) < 1.0e7) target.putFloat(pos, (float) mean);
                 }
             }
         }
-        // Recalculate the VST outer length fields after writing the custom chunk.
         ByteBuffer be = ByteBuffer.wrap(out).order(ByteOrder.BIG_ENDIAN);
         be.putInt(4, out.length - 8);
-        be.putInt(56, base.chunkSize);
+        be.putInt(56, outputChunkSize);
         return out;
     }
 

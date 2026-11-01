@@ -196,7 +196,7 @@ public final class ZipTrainingImporter {
                     } catch (Exception e) {
                         result.skippedFiles++;
                         destination.delete();
-                        addNote(result, "Invalid or unsupported FXP skipped: " + safePath);
+                        addNote(result, "Invalid or unsupported FXP skipped: " + safePath + " (" + safeMessage(e) + ")");
                     }
                 } else if (isAudio) {
                     audios.add(new Candidate(destination, safePath));
