@@ -99,7 +99,11 @@ public final class SylenthFxp {
         if (!innerMagic.equals("1lys") && !innerMagic.equals("syl1")) throw new IllegalArgumentException("The embedded Sylenth1 data header is not recognised.");
         ByteBuffer b = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
         int version = b.getInt(OUTER_HEADER_SIZE + 4);
-        if (version != 2011 && version != 2202 && version != 2211) throw new IllegalArgumentException("Unsupported Sylenth1 preset data version: " + version);
+        // 3045 is used by Sylenth1 3.0.45-era preset data. Its parameter map
+        // follows the newer layout (including ZEQMode before the 36-byte name).
+        if (version != 2011 && version != 2202 && version != 2211 && version != 3045) {
+            throw new IllegalArgumentException("Unsupported Sylenth1 preset data version: " + version);
+        }
         int nameOffset = version == 2011 ? 988 : 992;
         if (chunkSize < nameOffset) {
             throw new IllegalArgumentException("Sylenth1 preset data is truncated: version " + version
