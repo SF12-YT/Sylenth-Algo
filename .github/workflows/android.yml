@@ -94,7 +94,7 @@ jobs:
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: SylenthAI-v0.2.5-release-apk
+          name: SylenthAI-v0.2.6-release-apk
           path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 30

@@ -1,5 +1,10 @@
 package com.sf12.sylenthai.core;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.zip.DeflaterOutputStream;
+import java.util.zip.InflaterInputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -54,27 +59,31 @@ public final class SylenthFxp {
 
     public static final class Preset {
         public final byte[] bytes;
+        /** Parameter bytes: raw chunk data for legacy versions, inflated inner data for v3045. */
+        public final byte[] parameterData;
         public final int version;
         public final int chunkSize;
         public final int innerNameOffset;
         public final String name;
         public final float[] params;
 
-        private Preset(byte[] data, int version, int chunkSize, int innerNameOffset, String name) {
+        private Preset(byte[] data, byte[] parameterData, int version, int chunkSize,
+                       int innerNameOffset, String name) {
             this.bytes = data;
+            this.parameterData = parameterData;
             this.version = version;
             this.chunkSize = chunkSize;
             this.innerNameOffset = innerNameOffset;
             this.name = name;
-            this.params = readParams(data);
+            this.params = readParams(parameterData);
         }
 
-        private float[] readParams(byte[] data) {
+        private float[] readParams(byte[] parameterData) {
             float[] values = new float[FLOAT_OFFSETS.length];
-            ByteBuffer b = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+            ByteBuffer b = ByteBuffer.wrap(parameterData).order(ByteOrder.LITTLE_ENDIAN);
             for (int i = 0; i < FLOAT_OFFSETS.length; i++) {
-                int pos = OUTER_HEADER_SIZE + FLOAT_OFFSETS[i];
-                values[i] = (pos + 4 <= data.length) ? b.getFloat(pos) : Float.NaN;
+                int pos = FLOAT_OFFSETS[i];
+                values[i] = (pos + 4 <= parameterData.length) ? b.getFloat(pos) : Float.NaN;
             }
             return values;
         }
@@ -95,53 +104,71 @@ public final class SylenthFxp {
             throw new IllegalArgumentException("The FXP chunk size is invalid or the preset data is truncated.");
         }
         int chunkSize = (int) declaredChunkSize;
-        String innerMagic = ascii(data, OUTER_HEADER_SIZE, 4);
+        byte[] rawChunk = Arrays.copyOfRange(data, OUTER_HEADER_SIZE, OUTER_HEADER_SIZE + chunkSize);
+        String innerMagic = ascii(rawChunk, 0, 4);
         if (!innerMagic.equals("1lys") && !innerMagic.equals("syl1")) throw new IllegalArgumentException("The embedded Sylenth1 data header is not recognised.");
-        ByteBuffer b = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
-        int version = b.getInt(OUTER_HEADER_SIZE + 4);
-        // 3045 is used by Sylenth1 3.0.45-era preset data. Its parameter map
-        // follows the newer layout (including ZEQMode before the 36-byte name).
+        ByteBuffer b = ByteBuffer.wrap(rawChunk).order(ByteOrder.LITTLE_ENDIAN);
+        int version = b.getInt(4);
         if (version != 2011 && version != 2202 && version != 2211 && version != 3045) {
             throw new IllegalArgumentException("Unsupported Sylenth1 preset data version: " + version);
         }
-        int nameOffset = version == 2011 ? 988 : 992;
-        if (chunkSize < nameOffset) {
-            throw new IllegalArgumentException("Sylenth1 preset data is truncated: version " + version
-                    + " requires at least " + nameOffset + " bytes for its parameter data, but only " + chunkSize + " are present.");
+
+        byte[] parameterData;
+        int nameOffset;
+        if (version == 3045) {
+            // The 3045 wrapper is an 8-byte Sylenth signature/version followed by a
+            // zlib stream. The inflated stream contains the complete inner Sylenth
+            // header, parameters and trailing 36-byte preset name.
+            if (chunkSize <= 8) throw new IllegalArgumentException("Sylenth1 v3045 compressed preset payload is empty.");
+            byte[] compressed = Arrays.copyOfRange(rawChunk, 8, rawChunk.length);
+            parameterData = inflateZlib(compressed);
+            if (parameterData.length < 1028
+                    || !ascii(parameterData, 0, 4).equals(innerMagic)
+                    || readIntLE(parameterData, 4) != version) {
+                throw new IllegalArgumentException("Sylenth1 v3045 decompressed payload has an invalid inner header or is incomplete.");
+            }
+            nameOffset = parameterData.length - 36;
+            if (nameOffset < 992 || nameOffset <= FLOAT_OFFSETS[FLOAT_OFFSETS.length - 1]) {
+                throw new IllegalArgumentException("Sylenth1 v3045 decompressed parameter block is too short (" + parameterData.length + " bytes).");
+            }
+        } else {
+            parameterData = rawChunk;
+            nameOffset = version == 2011 ? 988 : 992;
+            if (chunkSize < nameOffset) {
+                throw new IllegalArgumentException("Sylenth1 preset data is truncated: version " + version
+                        + " requires at least " + nameOffset + " bytes for its parameter data, but only " + chunkSize + " are present.");
+            }
         }
-        int innerNameLength = Math.max(0, Math.min(36, chunkSize - nameOffset));
-        String name = innerNameLength > 0 ? readFixedAscii(data, OUTER_HEADER_SIZE + nameOffset, innerNameLength).trim() : "";
+
+        int innerNameLength = Math.max(0, Math.min(36, parameterData.length - nameOffset));
+        String name = innerNameLength > 0 ? readFixedAscii(parameterData, nameOffset, innerNameLength).trim() : "";
         if (name.isEmpty()) name = readFixedAscii(data, 28, 28).trim();
         if (name.isEmpty()) name = "Unnamed Sylenth1 preset";
-        return new Preset(Arrays.copyOf(data, data.length), version, chunkSize, nameOffset, name);
+        return new Preset(Arrays.copyOf(data, data.length), parameterData, version, chunkSize, nameOffset, name);
     }
 
     public static byte[] synthesize(Preset base, Preset[] neighbours, double[] weights, String outputName) {
-        int outputChunkSize = Math.max(base.chunkSize, base.innerNameOffset + 36);
-        int addedBytes = outputChunkSize - base.chunkSize;
-        byte[] out;
-        if (addedBytes > 0) {
-            int oldChunkEnd = OUTER_HEADER_SIZE + base.chunkSize;
-            out = new byte[base.bytes.length + addedBytes];
-            System.arraycopy(base.bytes, 0, out, 0, oldChunkEnd);
-            System.arraycopy(base.bytes, oldChunkEnd, out, oldChunkEnd + addedBytes, base.bytes.length - oldChunkEnd);
-        } else {
-            out = Arrays.copyOf(base.bytes, base.bytes.length);
-        }
         String safeName = sanitizeName(outputName == null ? "Sylenth AI Match" : outputName);
-        writeFixedAscii(out, 28, 28, safeName);
-        writeFixedAscii(out, OUTER_HEADER_SIZE + base.innerNameOffset, 36, safeName);
+        int requiredLength = base.innerNameOffset + 36;
+        byte[] parameterData = Arrays.copyOf(base.parameterData, Math.max(base.parameterData.length, requiredLength));
+        writeFixedAscii(parameterData, base.innerNameOffset, 36, safeName);
+
         if (neighbours != null && weights != null && neighbours.length == weights.length && neighbours.length > 1) {
             boolean compatible = true;
             for (Preset p : neighbours) {
-                if (p == null || p.version != base.version || p.chunkSize != base.chunkSize || !hasSameTopology(base, p)) { compatible = false; break; }
+                if (p == null || p.version != base.version
+                        || p.parameterData.length != parameterData.length
+                        || !hasSameTopology(base, p)) {
+                    compatible = false;
+                    break;
+                }
             }
             if (compatible) {
-                ByteBuffer target = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
+                ByteBuffer target = ByteBuffer.wrap(parameterData).order(ByteOrder.LITTLE_ENDIAN);
                 for (int j = 0; j < FLOAT_OFFSETS.length; j++) {
                     int offset = FLOAT_OFFSETS[j];
                     if (contains(DO_NOT_INTERPOLATE, offset)) continue;
-                    int pos = OUTER_HEADER_SIZE + offset;
+                    int pos = offset;
                     double wSum = 0.0, valueSum = 0.0;
                     boolean valid = true;
                     for (int n = 0; n < neighbours.length; n++) {
@@ -158,9 +185,29 @@ public final class SylenthFxp {
                 }
             }
         }
+
+        byte[] outputChunk;
+        if (base.version == 3045) {
+            byte[] compressed = deflateZlib(parameterData);
+            outputChunk = new byte[8 + compressed.length];
+            System.arraycopy(base.bytes, OUTER_HEADER_SIZE, outputChunk, 0, 8);
+            System.arraycopy(compressed, 0, outputChunk, 8, compressed.length);
+        } else {
+            outputChunk = parameterData;
+        }
+
+        int oldChunkEnd = OUTER_HEADER_SIZE + base.chunkSize;
+        int trailingLength = Math.max(0, base.bytes.length - oldChunkEnd);
+        byte[] out = new byte[OUTER_HEADER_SIZE + outputChunk.length + trailingLength];
+        System.arraycopy(base.bytes, 0, out, 0, OUTER_HEADER_SIZE);
+        System.arraycopy(outputChunk, 0, out, OUTER_HEADER_SIZE, outputChunk.length);
+        if (trailingLength > 0) {
+            System.arraycopy(base.bytes, oldChunkEnd, out, OUTER_HEADER_SIZE + outputChunk.length, trailingLength);
+        }
+        writeFixedAscii(out, 28, 28, safeName);
         ByteBuffer be = ByteBuffer.wrap(out).order(ByteOrder.BIG_ENDIAN);
         be.putInt(4, out.length - 8);
-        be.putInt(56, outputChunkSize);
+        be.putInt(56, outputChunk.length);
         return out;
     }
 
@@ -168,11 +215,11 @@ public final class SylenthFxp {
         for (int[] field : TOPOLOGY_FIELDS) {
             // ZEQMode was added only in newer preset data; in v2011 these bytes belong to the name.
             if (a.version == 2011 && field[0] == 990) continue;
-            int offset = OUTER_HEADER_SIZE + field[0];
+            int offset = field[0];
             int length = field[1];
-            if (offset + length > a.bytes.length || offset + length > b.bytes.length) return false;
+            if (offset + length > a.parameterData.length || offset + length > b.parameterData.length) return false;
             for (int i = 0; i < length; i++) {
-                if (a.bytes[offset + i] != b.bytes[offset + i]) return false;
+                if (a.parameterData[offset + i] != b.parameterData[offset + i]) return false;
             }
         }
         return true;
@@ -208,5 +255,39 @@ public final class SylenthFxp {
 
     private static int readIntBE(byte[] data, int offset) {
         return ByteBuffer.wrap(data, offset, 4).order(ByteOrder.BIG_ENDIAN).getInt();
+    }
+
+    private static int readIntLE(byte[] data, int offset) {
+        return ByteBuffer.wrap(data, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+    }
+
+    private static byte[] inflateZlib(byte[] compressed) {
+        final int maxInflatedBytes = 16 * 1024 * 1024;
+        try (InflaterInputStream in = new InflaterInputStream(new ByteArrayInputStream(compressed));
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = in.read(buffer)) != -1) {
+                if (out.size() + count > maxInflatedBytes) {
+                    throw new IllegalArgumentException("Sylenth1 v3045 decompressed data exceeds the 16 MB safety limit.");
+                }
+                out.write(buffer, 0, count);
+            }
+            return out.toByteArray();
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Sylenth1 v3045 zlib decompression failed: "
+                    + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
+        }
+    }
+
+    private static byte[] deflateZlib(byte[] uncompressed) {
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream();
+             DeflaterOutputStream deflater = new DeflaterOutputStream(out)) {
+            deflater.write(uncompressed);
+            deflater.finish();
+            return out.toByteArray();
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not recompress the Sylenth1 v3045 preset data.", e);
+        }
     }
 }
